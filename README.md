@@ -1,10 +1,8 @@
 # wolframfns
 
-A command line for wolframfns.
+Browse mathematical functions from [functions.wolfram.com](https://functions.wolfram.com) on the command line.
 
-`wolframfns` is a single pure-Go binary. It speaks to wolframfns over plain
-HTTPS, shapes the responses into clean records, and pipes into the rest of your
-tools. No API key, nothing to run alongside it.
+`wolframfns` is a single pure-Go binary. No API key required.
 
 ## Install
 
@@ -12,8 +10,7 @@ tools. No API key, nothing to run alongside it.
 go install github.com/tamnd/wolframfns-cli/cmd/wolframfns@latest
 ```
 
-Or grab a prebuilt binary from the [releases](https://github.com/tamnd/wolframfns-cli/releases), or run
-the container image:
+Or grab a prebuilt binary from the [releases](https://github.com/tamnd/wolframfns-cli/releases), or run the container image:
 
 ```bash
 docker run --rm ghcr.io/tamnd/wolframfns:latest --help
@@ -22,42 +19,40 @@ docker run --rm ghcr.io/tamnd/wolframfns:latest --help
 ## Usage
 
 ```bash
-wolframfns --help
-wolframfns version
+# List all mathematical functions (default 50)
+wolframfns list
+
+# Filter by category
+wolframfns list --category GammaBetaErf
+
+# Search by name or category
+wolframfns search Bessel
+
+# List all categories with function counts
+wolframfns categories
+
+# Output formats: table (default TTY), json, jsonl, csv, tsv, url, raw
+wolframfns list -o json
+wolframfns list --category ElementaryFunctions -o csv
 ```
 
-This is a fresh scaffold. The command tree starts with `version`; build out the
-real commands in `cli/` on top of the `wolframfns` library package.
+## Commands
 
-## Development
+| Command | Description |
+|---------|-------------|
+| `list` | List mathematical functions (optional `--category` filter) |
+| `search <query>` | Search by function name or category |
+| `categories` | List all categories with function counts |
+| `version` | Show version information |
+
+## Global flags
 
 ```
-cmd/wolframfns/   thin main, wires cli.Root into fang
-cli/                 the cobra command tree
-wolframfns/                the library: HTTP client and data models
-docs/                tago documentation site
+-o, --output string    output format: table|json|jsonl|csv|tsv|url|raw (default "auto")
+-n, --limit int        limit number of records (0 = command default)
+    --fields strings   comma-separated columns to include
+    --no-header        omit header row
+    --template string  Go text/template per record
+    --timeout duration per-request timeout (default 90s)
+    --delay duration   minimum spacing between requests
 ```
-
-```bash
-make build      # ./bin/wolframfns
-make test       # go test ./...
-make vet        # go vet ./...
-```
-
-## Releasing
-
-Push a version tag and GitHub Actions runs GoReleaser, which builds the
-archives, Linux packages, the multi-arch GHCR image, checksums, SBOMs, and a
-cosign signature:
-
-```bash
-git tag v0.1.0
-git push --tags
-```
-
-The Homebrew and Scoop steps self-disable until their tokens exist, so the first
-release works with no extra secrets.
-
-## License
-
-Apache-2.0. See [LICENSE](LICENSE).

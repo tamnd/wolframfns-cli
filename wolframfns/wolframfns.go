@@ -1,114 +1,210 @@
-// Package wolframfns is the library behind the wolframfns command line:
-// the HTTP client, request shaping, and the typed data models for wolframfns.
-//
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Package wolframfns provides access to functions.wolfram.com.
 package wolframfns
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to wolframfns. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "wolframfns/dev (+https://github.com/tamnd/wolframfns-cli)"
-
-// Client talks to wolframfns over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds client configuration.
+type Config struct {
+	BaseURL   string
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+}
 
+// DefaultConfig returns a Config with sensible defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   "https://functions.wolfram.com",
+		Rate:      500 * time.Millisecond,
+		Timeout:   90 * time.Second,
+		Retries:   3,
+		UserAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+	}
+}
+
+// Client fetches data from functions.wolfram.com sitemaps.
+type Client struct {
+	cfg  Config
+	http *http.Client
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
+// NewClient creates a new Client.
+func NewClient(cfg Config) *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
-	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
-		if attempt > 0 {
+const sitemapPath = "/sitemap_1.xml"
+
+// funcRe matches function root URL paths exactly: /{category}/{name}/
+var funcRe = regexp.MustCompile(`^/([A-Za-z][A-Za-z0-9-]*)/([A-Za-z][A-Za-z0-9]*)/$`)
+
+type urlset struct {
+	Locs []string `xml:"url>loc"`
+}
+
+func (c *Client) get(ctx context.Context, path string) ([]byte, error) {
+	if c.cfg.Rate > 0 {
+		if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
 			select {
+			case <-time.After(wait):
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
-		if err == nil {
-			return body, nil
-		}
-		lastErr = err
-		if !retry {
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.BaseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
+
+	var body []byte
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
+		resp, err := c.http.Do(req)
+		c.last = time.Now()
+		if err != nil {
+			if attempt < c.cfg.Retries {
+				time.Sleep(time.Duration(attempt+1) * time.Second)
+				continue
+			}
 			return nil, err
 		}
+		body, err = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			if attempt < c.cfg.Retries {
+				time.Sleep(time.Duration(attempt+1) * time.Second)
+				continue
+			}
+			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("not found")
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		}
+		break
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return body, nil
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
-	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+func (c *Client) fetchAll(ctx context.Context) ([]Function, error) {
+	data, err := c.get(ctx, sitemapPath)
 	if err != nil {
-		return nil, false, err
+		return nil, fmt.Errorf("fetch sitemap: %w", err)
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
-
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return nil, true, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
+	var us urlset
+	if err := xml.Unmarshal(data, &us); err != nil {
+		return nil, fmt.Errorf("parse sitemap: %w", err)
 	}
 
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
+	seen := make(map[string]struct{})
+	var funcs []Function
+	rank := 1
+	for _, loc := range us.Locs {
+		path := strings.TrimPrefix(loc, c.cfg.BaseURL)
+		m := funcRe.FindStringSubmatch(path)
+		if m == nil {
+			continue
+		}
+		key := m[1] + "/" + m[2]
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		funcs = append(funcs, Function{
+			Rank:     rank,
+			Category: m[1],
+			Name:     m[2],
+			URL:      loc,
+		})
+		rank++
 	}
-	return b, false, nil
+	return funcs, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
-func (c *Client) pace() {
-	if c.Rate <= 0 {
-		return
+// List returns functions, optionally filtered by category.
+func (c *Client) List(ctx context.Context, category string, limit int) ([]Function, error) {
+	all, err := c.fetchAll(ctx)
+	if err != nil {
+		return nil, err
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
-		time.Sleep(wait)
+	var out []Function
+	for _, f := range all {
+		if category != "" && !strings.EqualFold(f.Category, category) {
+			continue
+		}
+		out = append(out, f)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
 	}
-	c.last = time.Now()
+	for i := range out {
+		out[i].Rank = i + 1
+	}
+	return out, nil
 }
 
-func backoff(attempt int) time.Duration {
-	d := time.Duration(attempt) * 500 * time.Millisecond
-	if d > 5*time.Second {
-		d = 5 * time.Second
+// Search returns functions whose name or category contains query (case-insensitive).
+func (c *Client) Search(ctx context.Context, query string, limit int) ([]Function, error) {
+	all, err := c.fetchAll(ctx)
+	if err != nil {
+		return nil, err
 	}
-	return d
+	q := strings.ToLower(query)
+	var out []Function
+	for _, f := range all {
+		if strings.Contains(strings.ToLower(f.Name), q) || strings.Contains(strings.ToLower(f.Category), q) {
+			out = append(out, f)
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+	}
+	for i := range out {
+		out[i].Rank = i + 1
+	}
+	return out, nil
+}
+
+// Categories returns a list of categories with function counts.
+func (c *Client) Categories(ctx context.Context) ([]Category, error) {
+	all, err := c.fetchAll(ctx)
+	if err != nil {
+		return nil, err
+	}
+	counts := make(map[string]int)
+	for _, f := range all {
+		counts[f.Category]++
+	}
+	seen := make(map[string]struct{})
+	var cats []Category
+	rank := 1
+	for _, f := range all {
+		if _, ok := seen[f.Category]; ok {
+			continue
+		}
+		seen[f.Category] = struct{}{}
+		cats = append(cats, Category{Rank: rank, Name: f.Category, Count: counts[f.Category]})
+		rank++
+	}
+	return cats, nil
 }
